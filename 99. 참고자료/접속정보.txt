@@ -1,0 +1,11 @@
+코리아세븐 계정 K725009 / Korea711!
+
+DBSafer Agent
+K725009 / Fujitsu25!
+
+차세대 점포 개발DB 접속
+접속 이름 : KNSSD_207
+HOST = 10.72.10.207
+PORT = 11521
+SERVICE_NAME = KNSSD
+Username /Paswword : OPR/opr1!

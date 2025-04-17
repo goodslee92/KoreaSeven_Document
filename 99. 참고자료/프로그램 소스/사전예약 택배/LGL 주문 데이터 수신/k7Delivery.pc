@@ -1,0 +1,1087 @@
+/*
+ *  SYSTEM     : K7 Delivery
+ *  PROGRAM    : k7Delivery
+ *  FILE NAME  : k7Delivery.pc
+ *  FUNCTION   : 택배 접수 내역 수신 : 롯데글로벌로지스 -> K7
+ *  DESCRIPTION:
+ *  Copyright (c) 2005 LDCC All Right Reserved
+ *
+ ******************************************************************************
+ * sm test
+ *  REVISIONS  : 2019/02
+ */
+
+#define STDLIB_MEM_PTR_T        void
+#define STDLIB_MEM_SIZE_T       size_t
+
+#define RET_OK                  0
+#define RET_NG                  -1
+#define RET_DUP                 1
+
+#define THREAD_DBPROCESS_OK     0
+#define THREAD_DBPROCESS_DUP    1
+#define THREAD_DBPROCESS_NG     -1
+#define THREAD_RAISED_FAIL      -2
+
+#define SOCK_ON                 1
+#define SOCK_OFF                0
+#define SOCK_ERR                -1
+
+#define K7_MAX_MULTIPLEX        300
+#define EXIT_MSG                "XXXX"
+#define STAT_MSG                "STAT"
+#define TRACE_ON_MSG            "DSRT"
+#define TRACE_OFF_MSG           "DSTP"
+
+#include <sqlca.h>
+#include <poll.h>
+#include "k7common.h"
+#include "k7socket.h"
+#include "k7logging.h"
+#include "k7logging2.h"
+
+EXEC SQL BEGIN DECLARE SECTION;
+EXEC SQL INCLUDE k7Delivery.h;
+EXEC SQL END DECLARE SECTION;
+
+int gnSvrSocket;
+int gnMaxMultiplex;
+int gnRecvTimeout;
+int gnFlgProcessExit = FALSE;       /*쓰레드 종료 FLAG*/
+unsigned short gnPortNo;
+int gnTraceMode;
+
+char gszProcName[32];
+char gszUserName[20];
+char gszPassword[20];
+char gszDBAlias [20];
+char gszHostAddr[30];
+int gnHostPort;
+
+pthread_t hSvrThread;               /*서버쓰레드 핸들*/
+pthread_cond_t hEventExit;          /*종료 이벤트 핸들*/
+pthread_mutex_t hMutexExit;         /*종료 뮤텍스 핸들*/
+pthread_mutex_t hMutexLock;         /*DB 갱신 뮤텍스 핸들*/
+
+stStoreThreadTable *tblThread;  /*STORE 쓰레드 테이블*/
+
+void K7_Daemon_Init();
+int K7_WaitStoreService(int);
+int K7_RunStoreService(int);
+int K7_ThreadEventCreate();
+int K7_RaiseIdleThread(int *, char *);
+void K7_DeliveryService(void *);
+int K7_StartServer();
+void K7_ReleaseThread();
+int K7_StartService();
+int K7_ThreadBufferAlloc();
+int K7_SpreadThread();
+void K7_StoreService(int);
+int K7_SendToStorePOS(int *, char *, int, int);
+int K7_Initialize();
+int K7_ConnectDataBase(sql_context);
+int K7_ReConnectDataBase();
+void K7_WaitForTaskTerminate();
+void K7_Sleep(unsigned long);
+int K7_CheckMsgType(int *, char *, char *);
+
+void FormatDateTime(char *szDateTime);
+
+
+/* --------------------------------------------------------------------- */
+int main(int argc, char **argv) {
+    int nStat;
+    extern  char gszProcName[32];
+
+    K7_Daemon_Init();
+
+    strcpy(gszProcName, "k7Delivery");
+
+    nStat = K7_Initialize();
+    if ( nStat != RET_OK ) {
+        _TRC(gszProcName, "Stop (1)");
+        exit(1);
+    }
+
+    nStat = K7_StartService();
+    if ( nStat != RET_OK ) {
+        K7_ReleaseThread();
+        _TRC(gszProcName, "Stop (2)");
+        exit(2);
+    }
+
+    nStat = K7_StartServer();
+    if ( nStat != RET_OK ) {
+        K7_ReleaseThread();
+        _TRC(gszProcName, "Stop (3)");
+        exit(3);
+    }
+
+    /*종료 메시지 수신시 까지 대기*/
+    nStat = pthread_cond_wait(&hEventExit, &hMutexExit);
+    if ( nStat < 0 ) {
+        _TRC(gszProcName, "main, pthread wait fail..");
+    }
+    gnFlgProcessExit = TRUE;
+
+    K7_WaitForTaskTerminate();
+    K7_ReleaseThread();
+    K7_Sleep(1000 * 1);
+
+    _TRC(gszProcName, "Process Stop..");
+    exit(0);
+}
+
+/* --------------------------------------------------------------------- */
+void K7_Daemon_Init() {
+    pid_t   pid;
+    int fd;
+    int maxfd;
+
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+
+    if ( (pid = fork()) < 0 ) {
+        fprintf(stderr, "fork error");
+        return;
+    } else if ( pid != 0 ) exit(0);
+
+    setsid();
+
+    maxfd = getdtablesize();
+    for ( fd = 0; fd < maxfd; fd++ ) close(fd);
+
+    umask(0);
+}
+
+/* --------------------------------------------------------------------- */
+int K7_StartServer()
+{
+    int nId;
+    int nStat;
+    size_t  nStackSize;
+
+#ifdef __DCE_THREAD
+    pthread_attr_t  stAttr;
+#endif
+
+#ifdef  __DCE_THREAD
+    /*MP,defualt stack 32K*/
+    nStat = pthread_attr_init(&stAttr);
+    nStat = pthread_attr_setstacksize(&stAttr, 512*1024);
+    nStat = pthread_attr_getstacksize(&stAttr, &nStackSize);
+    nStat = pthread_create(&hSvrThread, &stAttr, (void *(*)(void *)) K7_DeliveryService, (void *)&nId);
+#else
+    nStat = pthread_create(&hSvrThread, NULL, K7_DeliveryService, (void *)&nId);
+#endif
+
+    if ( nStat < 0 ) {
+        _TRC(gszProcName, "K7_StartServer: TCP 쓰레드 생성 실패..");
+        return RET_NG;
+    }
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+void K7_DeliveryService(void *p)
+{
+    int nStat;
+    int nClientSocket;
+    char szClientIpAddr[16];
+    char szRcvBuf[stDeliHdrSize+1];
+
+    nStat = PsSocketCreate(&gnSvrSocket);
+    if ( nStat != RET_OK ) {
+        _TRC(gszProcName, "K7_DeliveryService: 소켓 생성 실패..");
+        pthread_cond_signal(&hEventExit);
+        pthread_exit(0);
+    }
+
+    nStat = (int)PsSocketBind(gnSvrSocket, &gnPortNo, NULL);
+    if ( nStat != RET_OK ) {
+        _TRC(gszProcName, "K7_DeliveryService: 소켓 바인드 실패..");
+        pthread_cond_signal(&hEventExit);
+        pthread_exit(0);
+    }
+
+    nStat = PsSocketListen(gnSvrSocket, gnMaxMultiplex);
+    if ( nStat != RET_OK ) {
+        _TRC(gszProcName, "K7_DeliveryService: 소켓 listen 1 실패..");
+        pthread_cond_signal(&hEventExit);
+        pthread_exit(0);
+    }
+
+    while ( !gnFlgProcessExit ) {
+        memset(szRcvBuf, 0, sizeof(szRcvBuf));
+        memset(szClientIpAddr, 0, sizeof(szClientIpAddr));
+        nStat = PsSocketAcceptByName(gnSvrSocket, &nClientSocket, &gnPortNo, szClientIpAddr);
+
+        if ( nStat == RET_OK ) {
+//            nStat = K7_CheckMsgType(&nClientSocket, szClientIpAddr, szRcvBuf);
+//            if ( nStat != RET_OK ) {
+//                PsSocketClose(&nClientSocket);
+//                continue;
+//            }
+            nStat = K7_RaiseIdleThread(&nClientSocket, szRcvBuf);
+            if ( nStat != RET_OK ) {
+                K7_SendToStorePOS(&nClientSocket, szRcvBuf, THREAD_RAISED_FAIL, 999);
+                PsSocketClose(&nClientSocket);
+            }
+        }
+        // L4 제외
+        else if ( nStat == PS_L4_NG ) 
+        {
+            if ( gnTraceMode ) _TRC( gszProcName, "K7_ServerService: 소켓 accept L4 제외 -PsSocketClose-" );
+            PsSocketClose( &nClientSocket );   
+        }        
+        else
+            if ( gnTraceMode ) { 
+                _TRC(gszProcName, "K7_DeliveryService: Socket accept Fail..");
+            }
+    }
+    PsSocketClose(&gnSvrSocket);
+
+    pthread_cond_signal(&hEventExit);
+    pthread_exit(0);
+}
+
+/* --------------------------------------------------------------------- */
+// 메시지에 따라 분기하는게 없으므로 미사용!!!
+int K7_CheckMsgType(int *nSocket, char *lpszClientIpAddr, char *lpszRcvBuf) {
+    int nStat;
+    int nRcvLen=4;
+    int nRcvInterval;
+    char    szIniPath[80];
+
+    if ( memcmp(lpszClientIpAddr, gszHostAddr, strlen(lpszClientIpAddr)) == 0 )        
+        return RET_OK;
+
+    nStat = PsSocketReceiveN(*nSocket, lpszRcvBuf, &nRcvLen, gnRecvTimeout);
+    if ( nStat != RET_OK ) {
+        PsInformation("K7_CheckMsgType: 초기 수신 실패..");
+        return nStat;
+    }
+
+    if ( gnTraceMode ) {
+        PsInformationDump("K7_CheckMsgType: Received Data", lpszRcvBuf, nRcvLen);
+    }
+
+    nStat = RET_NG;
+    if ( strncmp(lpszRcvBuf, EXIT_MSG, 4) == 0 ) {
+        PsInformation("K7_CheckMsgType: 종료");
+        gnFlgProcessExit = TRUE;
+    } else if ( strncmp(lpszRcvBuf, TRACE_ON_MSG, 4) == 0 ) {
+        PsInformation("K7_CheckMsgType: 점검");
+        gnTraceMode = TRUE;
+    } else if ( strncmp(lpszRcvBuf, TRACE_OFF_MSG, 4) == 0 ) {
+        gnTraceMode = FALSE;
+    } else if ( strncmp(lpszRcvBuf, STAT_MSG, 4) == 0 ) {
+        strcpy(szIniPath, "../ini/stat.txt");
+        PsWriteProfileString("[k7Delivery]", "Live", "00", szIniPath);
+    } else nStat = RET_OK;
+
+    return nStat;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_RaiseIdleThread(int *nSocket, char *lpszBuf) {
+    int i;
+    int nId;
+    int nStat;
+
+    for ( i = 0; i < gnMaxMultiplex; i++ ) {
+        if ( tblThread[i].nSockFlag == SOCK_OFF ) {
+            tblThread[i].nSocket = *nSocket;
+            tblThread[i].nSockFlag = SOCK_ON;
+            nId = i;
+            break;
+        }
+    }
+
+    if ( i >= gnMaxMultiplex ) {
+        PsInformation("K7_RaiseIdleThread: 남은쓰레드 없슴..");
+        return RET_NG;
+    }
+
+    nStat = pthread_cond_signal(&tblThread[nId].hEvent);
+    if ( nStat != 0 ) {
+        tblThread[nId].nSockFlag = SOCK_OFF;
+        PsInformation("K7_RaiseIdleThread: 쓰레드에 이벤트 발생 실패..");
+        return RET_NG;
+    }
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+void K7_WaitForTaskTerminate() {
+    int i = 0;
+    int nThreadStat;
+
+    while ( TRUE ) {
+        if ( i >= gnMaxMultiplex )  break;
+        nThreadStat = tblThread[i].nSockFlag;
+        if ( nThreadStat == SOCK_ON ) {
+            K7_Sleep(1000 * 1);
+            continue;
+        } else {
+            pthread_cond_signal(&tblThread[i].hEvent);
+            i++;
+        }
+    }
+}
+
+/* --------------------------------------------------------------------- */
+void K7_ReleaseThread() {
+    int nStat;
+    int i;
+
+    for ( i = 0; i < gnMaxMultiplex; i++ ) {
+#ifdef  __DCE_THREAD
+        pthread_cond_destroy(&tblThread[i].hEvent);
+        K7_Sleep(50);
+        pthread_mutex_destroy(&tblThread[i].hMutex);
+#endif
+    }
+    /*쓰레드 테이블 해제,쓰레드 종료*/
+    if ( tblThread != NULL ) free(tblThread);
+#ifdef  __DCE_THREAD
+    nStat = pthread_cond_destroy(&hEventExit);
+    nStat = pthread_mutex_destroy(&hMutexExit);
+    nStat = pthread_mutex_destroy(&hMutexLock);
+#endif
+
+    /*Release Database Context*/
+    EXEC SQL CONTEXT USE :Ctx;
+    EXEC SQL COMMIT WORK RELEASE;
+    EXEC SQL CONTEXT FREE :Ctx;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_StartService() {
+    if ( K7_ThreadBufferAlloc() != RET_OK ) return RET_NG;
+    if ( K7_ThreadEventCreate() != RET_OK ) return RET_NG;
+    if ( K7_SpreadThread() != RET_OK ) return RET_NG;
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_ThreadEventCreate() {
+    int i;
+    int nStat;
+
+#ifdef  __DCE_THREAD
+    for ( i = 0; i < gnMaxMultiplex; i++ ) {
+        /*이벤트 생성*/
+        nStat = pthread_cond_init(&tblThread[i].hEvent, NULL);
+        if ( nStat != 0 ) {
+            _TRC(gszProcName, "K7_ThreadEventCreate: 이벤트 생성 실패!.. 이벤트 No = %d ", i);
+
+            return RET_NG;
+        }
+
+        /*MUTEX 생성*/
+        nStat = pthread_mutex_init(&tblThread[i].hMutex, NULL);
+        if ( nStat != 0 ) {
+            _TRC(gszProcName, "K7_ThreadEventCreate: Mutex 생성 실패!.. Mutex No = %d ", i);
+
+            return RET_NG;
+        }
+    }
+#endif
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_ThreadBufferAlloc() {
+    int i;
+
+    /*점포쓰레드 테이블 생성*/
+    tblThread = (stStoreThreadTable *)malloc(stStoreThreadTableSize * gnMaxMultiplex);
+    if ( tblThread == NULL ) {
+        _TRC(gszProcName, "K7_ThreadBufferAlloc: ThreadTable memory allocation 실패");
+        return RET_NG;
+    }
+
+    for ( i = 0; i < gnMaxMultiplex; i++ ) {
+        tblThread[i].nSocket = SOCK_ERR;
+        tblThread[i].nSockFlag = SOCK_OFF;
+    }
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_SpreadThread() {
+#ifdef __DCE_THREAD
+    pthread_attr_t  stAttr;
+#endif
+
+    int i;
+    int nStat;
+    size_t  nStackSize;
+
+    for ( i = 0; i < gnMaxMultiplex; i++ ) {
+#ifdef  __DCE_THREAD
+        /*MP,defualt stack 32K*/
+        nStat = pthread_attr_init(&stAttr);
+        nStat = pthread_attr_setstacksize(&stAttr, 512*1024);
+        nStat = pthread_attr_getstacksize(&stAttr, &nStackSize);
+        nStat = pthread_create(&tblThread[i].hThread, &stAttr, (void *(*)(void *))K7_StoreService, (void *)(intptr_t)i);
+#else
+        nStat = pthread_create(&tblThread[i].hThread, NULL, K7_StoreService, (void *)(intptr_t)i);
+#endif
+        if ( nStat < 0 ) {
+            _TRC(gszProcName, "K7_SpreadThread: THREAD 생성 실패, thread no = %d ", i);
+            return RET_NG;
+        }
+    }
+
+    return RET_OK;
+}
+
+/* ---------------------------------------------------------------------
+ *  Thread Function
+ * --------------------------------------------------------------------- */
+void K7_StoreService(int nThreadNo) {
+    int nId = nThreadNo;
+    int nStat;
+
+    while ( TRUE ) {
+        nStat = K7_WaitStoreService(nId);
+        if ( nStat != RET_OK ) {
+            tblThread[nId].nSockFlag = SOCK_ERR;
+            _TRC(gszProcName, " thread wait event fail.. thread no=[%d]", nId);
+            pthread_exit(0);
+            return;
+        }
+        if ( gnFlgProcessExit ) break;
+
+        K7_RunStoreService(nId);
+    }
+    pthread_exit(0);
+}
+
+/* --------------------------------------------------------------------- */
+int K7_WaitStoreService(int nId) {
+    int nStat;
+
+    tblThread[nId].nSockFlag = SOCK_OFF;
+
+    nStat = pthread_cond_wait(&tblThread[nId].hEvent, &tblThread[nId].hMutex);
+    if ( nStat < 0 ) return RET_NG;
+
+    return RET_OK;
+}
+
+/* ---------------------------------------------------------------------
+ * 처리 함수 시작
+ * --------------------------------------------------------------------- */
+int K7_RunStoreService(int nId) {
+    int nStat;
+    int nSocket = tblThread[nId].nSocket;
+    int nLen;
+    int nItemCnt;
+    int i, nRspCode=0, len;
+
+    char szSndBuf      [MAX_IRT_SIZE+1] = {0,};
+    char szRcvBuf      [MAX_IRT_SIZE+1] = {0,};
+
+    char szMesgCd      [  4+1] = {0,};
+    char szRespCd      [  4+1] = {0,};
+    char szTranDt      [ 14+1] = {0,};
+    char szReqCnt      [  3+1] = {0,};
+
+    char szGbn         [  2+1] = {0,};
+    char szReceiptNo   [ 30+1] = {0,};
+    char szShipper     [224+1] = {0,};
+    char szConsignee   [ 50+1] = {0,};
+    char szConsTelNo   [ 20+1] = {0,};
+    char szConsMobPhone[ 20+1] = {0,};
+    char szConsPostNo  [ 10+1] = {0,};
+    char szConsAddr1   [100+1] = {0,};
+    char szConsAddr2   [100+1] = {0,};
+    char szItemNm      [200+1] = {0,};
+    char szAmount1     [  9+1] = {0,};
+    char szAmount2     [  9+1] = {0,};
+    char szAmount3     [  9+1] = {0,};
+    char szReceiptDy   [  8+1] = {0,};
+    char szFiller      [100+1] = {0,};
+
+    char szResultCode  [  4+1] = {0,};
+    char errMesssage   [ 50+1] = {0,};
+
+    char szItemSeq[20];
+    char DateTime [20];
+
+    char szTmpBuf      [MAX_IRT_SIZE+1] = {0,};
+    char szEncBuf      [MAX_IRT_SIZE+1] = {0,};
+
+    stDeliHdr   *pSndHead = (stDeliHdr *)szSndBuf;
+    stDeliHdr   *pRcvHead = (stDeliHdr *)szRcvBuf;
+
+    stDeliData  *pData;
+    stDeliRcv   *pRcvData;
+
+    char *p;
+
+    struct pollfd   pfd;
+#ifdef _DEBUG
+    struct  timeb start, end;
+    double  elapsed;
+
+    ftime(&start);
+#endif
+    //_TRC(gszProcName, "K7_RunStoreService: 수신 쓰레드(%d) 시작..", nId);
+    PsInformation(CrFmt("K7_RunStoreService: 수신 쓰레드(%d) 시작..", nId));
+
+    /* 소켓 상태변화 폴링 */
+    pfd.fd      = nSocket;
+    pfd.events  = POLLIN | POLLHUP;
+    pfd.revents = 0;
+    while ( pfd.revents == 0 ) {
+        if ( gnFlgProcessExit ) goto WorkEnd;
+        poll(&pfd, 1, 500);
+        if ( pfd.revents ) break;
+    }
+
+    memset(szSndBuf, 0x20, sizeof(szSndBuf));
+    memset(szRcvBuf, 0x20, sizeof(szRcvBuf));
+    memset(szTmpBuf, 0x00, sizeof(szTmpBuf));
+
+//    nLen = stDeliHdrSize - 4; // 201904 CKS DEL 위 K7_CheckMsgType함수에서 4byte를 검토하지 않으므로 -4부분을 제거함
+    nLen = stDeliHdrSize;
+
+    nStat = PsSocketReceiveN(nSocket, szTmpBuf, &nLen, gnRecvTimeout);
+
+    szTmpBuf[nLen] = 0;
+
+    memcpy(szSndBuf, szTmpBuf, nLen);
+    _TRC(gszProcName, "PsSocketReceiveN stDeliHdr = [%d][%s]", nLen, szTmpBuf);
+
+    memcpy(szMesgCd, pSndHead->MesgCd, sizeof(pSndHead->MesgCd));
+    memcpy(szRespCd, pSndHead->RespCd, sizeof(pSndHead->RespCd));
+    memcpy(szTranDt, pSndHead->TranDt, sizeof(pSndHead->TranDt));
+    memcpy(szReqCnt, pSndHead->ReqCnt, sizeof(pSndHead->ReqCnt));
+
+    nItemCnt = atoi(szReqCnt);
+    _TRC(gszProcName, "K7_RunStoreService(nId=%d): nItemCnt =   [%d]\n", nId, nItemCnt);     
+
+/*
+    _TRC(gszProcName, "szMesgCd     = [%s]", szMesgCd    );
+    _TRC(gszProcName, "szRespCd     = [%s]", szRespCd);
+    _TRC(gszProcName, "szTranDt     = [%s]", szTranDt    );
+    _TRC(gszProcName, "szReqCnt     = [%s]", szReqCnt    );
+*/
+
+    // 위 방식은 IO가 많이 발생함
+    _TRC(gszProcName, "szMesgCd     = [%s]\n"
+                      "szRespCd     = [%s]\n"
+                      "szTranDt     = [%s]\n"
+                      "szReqCnt     = [%s]\n"
+                      , szMesgCd
+                      , szRespCd
+                      , szTranDt
+                      , szReqCnt);
+
+    /* Body 수신*/
+    nLen = stDeliDataSize * nItemCnt;
+    nStat = PsSocketReceiveN(nSocket, &szSndBuf[stDeliHdrSize], &nLen, gnRecvTimeout);
+
+    szSndBuf[stDeliHdrSize + stDeliDataSize * nItemCnt] = 0;
+    _TRC(gszProcName, "K7_RunStoreService(nId=%d): 수신 전문[%s]", nId, szSndBuf);
+
+    szRcvBuf[stDeliHdrSize + stDeliRcvSize * nItemCnt] = 0;
+
+    for(i=0; i<nItemCnt; i++) {
+        memset(szTmpBuf, 0x00, sizeof(szTmpBuf));
+        p = &szSndBuf[stDeliHdrSize + stDeliDataSize * i];
+
+        memcpy(szEncBuf, p, stDeliDataSize);
+
+        len = 0;
+        memcpy(szGbn         , &szEncBuf[len],   2); len += sizeof(szGbn)          -1;
+        memcpy(szReceiptNo   , &szEncBuf[len],  30); len += sizeof(szReceiptNo)    -1;
+        memcpy(szShipper     , &szEncBuf[len], 224); len += sizeof(szShipper)      -1;
+        memcpy(szConsignee   , &szEncBuf[len],  50); len += sizeof(szConsignee)    -1;
+        memcpy(szConsTelNo   , &szEncBuf[len],  20); len += sizeof(szConsTelNo)    -1;
+        memcpy(szConsMobPhone, &szEncBuf[len],  20); len += sizeof(szConsMobPhone) -1;
+        memcpy(szConsPostNo  , &szEncBuf[len],  10); len += sizeof(szConsPostNo)   -1;
+        memcpy(szConsAddr1   , &szEncBuf[len], 100); len += sizeof(szConsAddr1)    -1;
+        memcpy(szConsAddr2   , &szEncBuf[len], 100); len += sizeof(szConsAddr2)    -1;
+        memcpy(szItemNm      , &szEncBuf[len], 200); len += sizeof(szItemNm)       -1;
+        memcpy(szAmount1     , &szEncBuf[len],   9); len += sizeof(szAmount1)      -1;
+        memcpy(szAmount2     , &szEncBuf[len],   9); len += sizeof(szAmount2)      -1;
+        memcpy(szAmount3     , &szEncBuf[len],   9); len += sizeof(szAmount3)      -1;
+        memcpy(szReceiptDy   , &szEncBuf[len],   8); len += sizeof(szReceiptDy)    -1;
+
+/*
+        _TRC(gszProcName, "szGbn           = [%s]", szGbn         );
+        _TRC(gszProcName, "szReceiptNo     = [%s]", szReceiptNo   );
+        _TRC(gszProcName, "szShipper       = [%s]", szShipper     );
+        _TRC(gszProcName, "szConsignee     = [%s]", szConsignee   );
+        _TRC(gszProcName, "szConsTelNo     = [%s]", szConsTelNo   );
+        _TRC(gszProcName, "szConsMobPhone  = [%s]", szConsMobPhone);
+        _TRC(gszProcName, "szConsPostNo    = [%s]", szConsPostNo  );
+        _TRC(gszProcName, "szConsAddr1     = [%s]", szConsAddr1   );
+        _TRC(gszProcName, "szConsAddr2     = [%s]", szConsAddr2   );
+        _TRC(gszProcName, "szItemNm        = [%s]", szItemNm      );
+        _TRC(gszProcName, "szAmount1       = [%s]", szAmount1     );
+        _TRC(gszProcName, "szAmount2       = [%s]", szAmount2     );
+        _TRC(gszProcName, "szAmount3       = [%s]", szAmount3     );
+        _TRC(gszProcName, "szReceiptDy     = [%s]", szReceiptDy   );
+*/
+        // 위 방식은 IO가 많이 발생함
+        _TRC(gszProcName, "szGbn           = [%s]\n"
+                          "szReceiptNo     = [%s]\n"
+                          "szShipper       = [%s]\n"
+                          "szConsignee     = [%s]\n"
+                          "szConsTelNo     = [%s]\n"
+                          "szConsMobPhone  = [%s]\n"
+                          "szConsPostNo    = [%s]\n"
+                          "szConsAddr1     = [%s]\n"
+                          "szConsAddr2     = [%s]\n"
+                          "szItemNm        = [%s]\n"
+                          "szAmount1       = [%s]\n"
+                          "szAmount2       = [%s]\n"
+                          "szAmount3       = [%s]\n"
+                          "szReceiptDy     = [%s]\n"
+                          , szGbn
+                          , szReceiptNo
+                          , szShipper
+                          , szConsignee
+                          , szConsTelNo
+                          , szConsMobPhone
+                          , szConsPostNo
+                          , szConsAddr1
+                          , szConsAddr2
+                          , szItemNm
+                          , szAmount1
+                          , szAmount2
+                          , szAmount3
+                          , szReceiptDy);
+
+        nRspCode = 0;
+
+        char szStatFg[1+1]; // 상태구분(0:반품지시,1:반품접수,2:수거완료,D:장기미집하삭제) 9:취소접수
+
+        pthread_mutex_lock(&hMutexLock);
+        
+        // 구분 정상:"12", 취소접수:"21"
+        if (strcmp(szGbn, "21") == 0) { // 201904 CKS ADD FedEx에서 접수취소 시 STAT_FG = '9' 로 변경
+            _TRC(gszProcName, "K7_RunStoreService(nId=%d): szGbn    =   [%s]", nId, szGbn);
+            
+            EXEC SQL
+            UPDATE ST_ADM.TB_ST_LOTTEMALL_DAT_LT    --ST_롯데홈쇼핑반품회수현대택배내역
+               SET TKBK_STT_DV_CD = '9'     --반품상태구분코드
+                 , JOB_YMD = TO_CHAR(SYSDATE,'YYYYMMDD')    --작업일자                 
+             WHERE ACP_NO = TRIM(:szReceiptNo)  --접수번호
+            ;
+        } else if (strcmp(szGbn, "30") == 0) {  //202209 FedEx INBOUND 서비스 입고완료 데이터 수신 처리
+            _TRC(gszProcName, "K7_RunStoreService(nId=%d): szGbn    =   [%s]", nId, szGbn);
+            
+            EXEC SQL
+            UPDATE ST_ADM.TB_ST_LOTTEMALL_DAT_LT    --ST_롯데홈쇼핑반품회수현대택배내역
+               SET WARH_CMP_YN =    'Y'
+                 , UPD_DT   =   SYSDATE --수정일시    
+             WHERE ACP_NO = TRIM(:szReceiptNo)  --접수번호
+            ;
+            
+            
+        } else {
+            _TRC(gszProcName, "K7_RunStoreService(nId=%d): szGbn    =   [%s]", nId, szGbn);
+            
+            EXEC SQL
+            INSERT INTO ST_ADM.TB_ST_LOTTEMALL_DAT_LT   --ST_롯데홈쇼핑반품회수현대택배내역
+                   (
+                     ACP_NO             --접수번호
+                   , TKBK_APLC_NM       --반품접수자명
+                   , TKBK_APLC_TEL_NO   --반품접수자전화번호
+                   , TKBK_APLC_CPHN_NO  --반품접수자휴대폰번호
+                   , TKBK_APLC_ZIP_NO   --반품접수자우편번호
+                   , TKBK_APLC_BAS_ADDR --반품접수자기본주소
+                   , TKBK_APLC_DL_ADDR  --반품접수자상세주소
+                   , RTDT_NM            --반품처명
+                   , RTDT_TEL_NO        --반품처전화번호
+                   , RTDT_CPHN_NO       --반품처휴대폰번호
+                   , RTDT_ZIP_NO        --반품처우편번호
+                   , RTDT_BAS_ADDR      --반품처기본주소
+                   , RTDT_DL_ADDR       --반품처상세주소
+                   , ITEM_NM            --상품명
+                   , ITEM_QTY           --상품수량
+                   , CRDT_NO            --신용번호
+                   , PYM_DV_CD          --결제구분코드
+                   , BAS_FARE_AMT       --기본운임금액
+                   , CST_AMT2           --비용금액2
+                   , CST_AMT3           --비용금액3
+                   , ACP_YMD            --접수일자
+                   , LIMLL_REG_DT       --롯데홈쇼핑등록일시
+                   , JOB_YMD            --작업일자
+                   , TKBK_STT_DV_CD     --반품상태구분코드
+                   , REG_USER_ID    --등록사용자ID
+                   , REG_DT         --등록일시
+                   , UPD_USER_ID    --수정사용자ID
+                   , UPD_DT         --수정일시  
+
+                   )
+                   VALUES
+                   (
+                     TRIM(:szReceiptNo)  --접수번호
+                   , TRIM(CASE WHEN :szShipper like '%*%' THEN :szShipper
+                               ELSE SUBSTR(:szShipper, 1, 2) || '*' || SUBSTR(:szShipper, 5, 224) end) /* 20170106 이한민 마스킹 수정 */ --반품접수자명
+                   , ' '                                  --반품접수자전화번호
+                   , ' '                                  --반품접수자휴대폰번호
+                   , ' '                                  --반품접수자우편번호
+                   , ' '                                  --반품접수자기본주소
+                   , ' '                                  --반품접수자상세주소
+                   , TRIM(:szConsignee)                   --반품처명
+                   , TRIM(:szConsTelNo)                   --반품처전화번호
+                   , TRIM(:szConsMobPhone)                --반품처휴대폰번호
+                   , TRIM(:szConsPostNo)                  --반품처우편번호
+                   , TRIM(:szConsAddr1)                   --반품처기본주소
+                   , TRIM(:szConsAddr2)                   --반품처상세주소
+                   , REPLACE(trim(:szItemNm), '''', '')   --상품명
+                   , 1                                    --상품수량
+                   , '3006193'                            --신용번호
+                   , 'CD'                                 --결제구분코드
+                   , TRIM(:szAmount1)                     --기본운임금액
+                   , TRIM(:szAmount2)                     --비용금액2
+                   , TRIM(:szAmount3)                     --비용금액3
+                   , TRIM(:szReceiptDy)                   --접수일자
+                   , SYSDATE                              --롯데홈쇼핑등록일시
+                   , TO_CHAR(SYSDATE,'YYYYMMDD')          --작업일자
+                   , '0'                                  --반품상태구분코드
+                   , 'SYSTEM'        --등록사용자ID   
+                   , SYSDATE         --등록일시       
+                   , 'SYSTEM'        --수정사용자ID   
+                   , SYSDATE         --수정일시       
+                   )
+                ;
+        }
+
+        if ( SQLCODE != SQL_OK ) {  // 오류 처리
+            _TRC(gszProcName, "K7_RunStoreService(nId=%d): Insert/Update fail.., "
+                                "sqlcode=[%d(%.200s)]",
+                                nId, SQLCODE, SQLERRTXT);
+            nRspCode = 9201;
+            sprintf(errMesssage, "%-50s", "Insert/Update Error");
+            EXEC SQL ROLLBACK WORK;
+        } else {    // 정상 처리
+            _TRC(gszProcName, "K7_RunStoreService(nId=%d): DB Insert/Update Success.", nId);
+            sprintf(errMesssage, "%-50s", "Success.");
+            EXEC SQL COMMIT WORK;
+        }
+        
+        pthread_mutex_unlock(&hMutexLock);
+
+        sprintf(szResultCode, "%04d", nRspCode);
+        memset (szFiller , 0x20, sizeof(szFiller)-1);
+
+        pRcvData = (stDeliRcv *)&szRcvBuf[stDeliHdrSize + stDeliDataSize * i];
+
+/*
+        _TRC(gszProcName, "szReceiptNo  = [%s]\n", szReceiptNo );
+        _TRC(gszProcName, "szResultCode = [%s]\n", szResultCode);
+        _TRC(gszProcName, "errMesssage  = [%s]\n", errMesssage );
+        _TRC(gszProcName, "szFiller     = [%s]\n", szFiller    );
+*/
+        // 위 방식은 IO가 많이 발생함
+        _TRC(gszProcName, "szReceiptNo  = [%s]\n"
+                          "szResultCode = [%s]\n"
+                          "errMesssage  = [%s]\n"
+                          "szFiller     = [%s]\n"
+                          , szReceiptNo
+                          , szResultCode
+                          , errMesssage
+                          , szFiller);
+
+        memcpy(pRcvData->ReceiptNo, szReceiptNo , strlen(szReceiptNo));
+        memcpy(pRcvData->RespCd   , szResultCode, strlen(szResultCode));
+        memcpy(pRcvData->ErrorMesg, errMesssage , strlen(errMesssage));
+        memcpy(pRcvData->Filler   , szFiller    , strlen(szFiller));
+
+_TRC(gszProcName, "szRcvBuf = [%d][%s]\n", i, szRcvBuf); 
+    }
+
+    pRcvHead = (stDeliHdr *)&szRcvBuf[0];
+    //memcpy(szRcvBuf, szSndBuf, stDeliHdrSize);
+
+    FormatDateTime(DateTime);
+
+    // 취소전문 일 경우 20190423 CKS UPDATE
+    if (strcmp(szMesgCd, "2000") == 0) {
+        memcpy(pRcvHead->MesgCd, "2001"  , 4 ); // 취소
+    } else {
+        memcpy(pRcvHead->MesgCd, "1001"  , 4 ); // 정상
+    }
+    memcpy(pRcvHead->RespCd, "0000"  , 4 );
+    memcpy(pRcvHead->TranDt, DateTime, 14);
+    memcpy(pRcvHead->ReqCnt, szReqCnt, 3 );
+
+    szRcvBuf[stDeliHdrSize + stDeliRcvSize * nItemCnt] = 0;
+    nLen = stDeliHdrSize + stDeliRcvSize * nItemCnt;
+    
+    _TRC(gszProcName, "K7_RunStoreService(nId=%d): 발신 전문(%d)[%s]", nId, nLen, szRcvBuf);
+
+    nStat = (int)PsSocketSend(nSocket, szRcvBuf, nLen);
+    if ( nStat != RET_OK ) {
+        _TRC(gszProcName, "K7_SendToStorePOS: Socket Send fail.. thread no=[%d]", nId);
+        return RET_NG;
+    }
+
+WorkEnd:
+    PsSocketClose(&nSocket);
+    //_TRC(gszProcName, "K7_FileRecv: 파일 수신 쓰레드(%d) 종료..", nId);
+    PsInformation(CrFmt("K7_FileRecv: 파일 수신 쓰레드(%d) 종료..", nId));
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
+
+struct {
+    int     MsgKind;
+    int     (*IrtFunc)(char *);
+} stFuncTbl[] = {
+
+    { 0, NULL              }
+};
+
+/** 처리 함수 끝 **************************************************************/
+
+
+/* --------------------------------------------------------------------- */
+int K7_SendToStorePOS(int *nSock, char *lpszBuf, int nProcFg, int nThreadNo) {
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+
+
+/* --------------------------------------------------------------------- */
+int K7_Initialize() {
+    char szIniPath[512] = {0,};
+    char szBuf[512] = {0,};
+    int nSize = 256;
+    int nStat;
+
+    strcpy(szIniPath, "../ini/config.ini");
+
+    /*TRACE MODE 취득*/
+    nStat = PsGetProfileString("[k7Delivery]", "TraceMode", "0", szBuf, nSize, szIniPath);
+    gnTraceMode = atoi(szBuf);
+
+    /*수신 PORT NO*/
+    nStat = PsGetProfileString("[k7Delivery]", "ReceivePort", "20900", szBuf, nSize, szIniPath);
+    gnPortNo = atoi(szBuf);
+
+    /*최대 다중도 건수 취득*/
+    nStat = PsGetProfileString("[k7Delivery]", "ThreadMaxCount", "80", szBuf, nSize, szIniPath);
+    gnMaxMultiplex = atoi(szBuf);
+
+    /*수신 대기 시간*/
+    nStat = PsGetProfileString("[k7Delivery]", "ReceiveTimeout", "10", szBuf, nSize, szIniPath);
+    gnRecvTimeout = atoi(szBuf) * 1000;
+
+    if ( gnMaxMultiplex > K7_MAX_MULTIPLEX ) return RET_NG;
+    
+/* 개발용 */
+    /*DB USER*/
+//    nStat = PsGetProfileString("[k7DbInfo]", "USERNAME", "STORE", szBuf, nSize, szIniPath);
+//    strcpy(gszUserName, szBuf);
+
+    /*DB PASSWORD*/
+//    nStat = PsGetProfileString("[k7DbInfo]", "PASSWORD", "STORE", szBuf, nSize, szIniPath);
+//    strcpy(gszPassword, szBuf);
+
+    /*DB ALIAS명*/
+//    nStat = PsGetProfileString("[k7DbInfo]", "ALIASNAME", "k7md_APP", szBuf, nSize, szIniPath);
+//    strcpy(gszDBAlias, szBuf);
+/*============================================================*/
+
+    /*DB USER*/                                             
+    nStat = PsGetProfileString("[COMMON]", "USERNAME", "ST_APP", szBuf, nSize, szIniPath);
+    strcpy(gszUserName, szBuf);
+
+    /*DB PASSWORD*/
+    nStat = PsGetProfileString("[COMMON]", "PASSWORD", "st_app1!", szBuf, nSize, szIniPath);
+    strcpy(gszPassword, szBuf);
+
+    /*DB ALIAS명*/
+    nStat = PsGetProfileString("[COMMON]", "ALIASNAME", "KNSSD", szBuf, nSize, szIniPath);
+    strcpy(gszDBAlias, szBuf);
+
+    if ( gnTraceMode ) {
+        _TRC(gszProcName, "K7_Initialize: ini file정의내용.. "
+                          "TraceMode=%d, 수신PortNo=%d, 수신대기시간=%d, "
+                          "쓰레드건수=%d, DB User=%s, DB Password=%s, DB Alias=%s",
+                          gnTraceMode, gnPortNo, gnRecvTimeout, gnMaxMultiplex,
+                          gszUserName, gszPassword, gszDBAlias);
+    }
+
+    /*종료 EVENT 생성*/
+#ifdef __DCE_THREAD
+    nStat = pthread_cond_init(&hEventExit, NULL);
+    if ( nStat != 0 ) {
+        _TRC(gszProcName, "종료이벤트 생성 실패..");
+        return RET_NG;
+    }
+
+    nStat = pthread_mutex_init(&hMutexExit, NULL);
+    if ( nStat != 0 ) {
+        nStat = pthread_cond_destroy(&hEventExit);
+        _TRC(gszProcName, "종료 Mutex 생성 실패..");
+        return RET_NG;
+    }
+
+    /*DB LOCK MUTEX 생성*/
+    nStat = pthread_mutex_init(&hMutexLock, NULL);
+    if ( nStat != 0 ) {
+        pthread_cond_destroy(&hEventExit);
+        pthread_mutex_destroy(&hMutexExit);
+        _TRC(gszProcName, "DB Lock Mutex 생성 실패..");
+        return RET_NG;
+    }
+#endif
+
+    /*ORACLE DB 접속*/
+    EXEC SQL CONTEXT ALLOCATE :Ctx;
+
+    nStat = K7_ConnectDataBase(Ctx);
+    if ( nStat != RET_OK ) {
+        _TRC(gszProcName, "K7_Initialize: K7_ConnectDataBase 실패, %.200s", SQLERRTXT);
+        EXEC SQL CONTEXT FREE :Ctx;
+
+        /*EVENT 종료*/
+        pthread_cond_destroy(&hEventExit);
+        pthread_mutex_destroy(&hMutexExit);
+        pthread_mutex_destroy(&hMutexLock);
+        return RET_NG;
+    }
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_ConnectDataBase(sql_context Ctx) {
+    /*USE CONTEXT*/
+    EXEC SQL CONTEXT USE :Ctx;
+
+    /*ORACLE 접속*/
+    if ( strlen(gszDBAlias) )
+        EXEC SQL CONNECT :gszUserName IDENTIFIED BY :gszPassword USING :gszDBAlias;
+    else
+        EXEC SQL CONNECT :gszUserName IDENTIFIED BY :gszPassword;
+
+
+    /*접속 실패*/
+    if ( SQLCODE < 0 ) {
+        _TRC(gszProcName, "K7_ConnectDatabase: DB 접속실패(%s/%s@%s)%.200s",
+                            gszUserName, gszPassword, gszDBAlias, SQLERRTXT);
+        return RET_NG;
+    }
+    _TRC(gszProcName, "Oracle DB Connected %s/%s@%s", gszUserName, gszPassword, gszDBAlias);
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_ReConnectDataBase() {
+    int nStat;
+
+    if ( SQLCODE != SQLDISCONNECT_0 && SQLCODE != SQLDISCONNECT_1 ) return RET_OK;
+
+    EXEC SQL CONTEXT USE :Ctx;
+    EXEC SQL COMMIT WORK RELEASE;
+    EXEC SQL CONTEXT FREE :Ctx;
+
+    EXEC SQL CONTEXT ALLOCATE :Ctx;
+    nStat = K7_ConnectDataBase(Ctx);
+    if ( nStat != RET_OK ) {
+        gnFlgProcessExit = TRUE;
+        pthread_cond_signal(&hEventExit);
+        _TRC(gszProcName, "K7_ReConnectDataBase: DB 재접속실패 = %.200s", SQLERRTXT);
+        return RET_NG;
+    }
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_InitHostSocket(int *nSocket) {
+    if ( PsSocketCreate(nSocket) != RET_OK ) {
+        _TRC(gszProcName, "K7_InitHostSocket: HOST 소켓 생성 실패");
+        return RET_NG;
+    }
+
+    if ( PsSocketConnectByIP(*nSocket, gszHostAddr, gnHostPort) != RET_OK ) {
+        _TRC(gszProcName, "K7_InitHostSocket: Host(%s:%d) 접속 실패",
+                          gszHostAddr, gnHostPort);
+        return RET_NG;
+    }
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_HostSendProc(int *nSocket, char *lpszBuf) {
+    int nLen;
+    int nStat;
+
+    K7_Sleep(200);
+    nLen = strlen(lpszBuf);
+    nStat = PsSocketSend(*nSocket, lpszBuf, nLen);
+/*if ( gnTraceMode ) _TRC(gszProcName, "[>> HST] %s", lpszBuf);*/
+
+    return nStat;
+}
+
+/* --------------------------------------------------------------------- */
+int K7_HostRecvProc(int *nSocket, char *lpszBuf, int nLen) {
+    int nStat;
+
+    if ( (nStat = PsSocketReceiveN(*nSocket, lpszBuf,
+                                   &nLen, gnRecvTimeout)) != RET_OK ) {
+        _TRC(gszProcName, "K7_HostRecvProc: HOST 헤더 응답 수신 이상");
+        return nStat;
+    }
+
+    lpszBuf[nLen] = 0;
+/*if ( gnTraceMode ) _TRC(gszProcName, "[<< HST] %s", lpszBuf);*/
+
+    return RET_OK;
+}
+
+/* --------------------------------------------------------------------- */
+void K7_Sleep(unsigned long lnMilliSecond) {
+    struct  timeval delay;
+    unsigned long int nMicroSecond;
+    int nWaitTime;
+
+    nMicroSecond = lnMilliSecond * 1000;
+
+    delay.tv_sec = nMicroSecond / (unsigned long)1000000;
+    delay.tv_usec = (nMicroSecond % (unsigned long)1000000);
+
+    if ( select(0, NULL, NULL, NULL, &delay) == -1 ) {
+        nWaitTime = (int)(lnMilliSecond / 1000);
+        if ( nWaitTime == 0 ) sleep(1);
+        else sleep(nWaitTime);
+    }
+}
+
+void FormatDateTime(char *szDateTime) {
+    time_t timeDate;
+    struct tm *tm;
+
+    time(&timeDate);
+    tm = (struct tm *)localtime(&timeDate);
+
+    sprintf(szDateTime, "%04d%02d%02d%02d%02d%02d", tm->tm_year + 1900, tm->tm_mon+1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+}
